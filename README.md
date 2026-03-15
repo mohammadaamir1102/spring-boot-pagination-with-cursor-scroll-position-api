@@ -334,6 +334,41 @@ GET /scroll
 
 ---
 
+## 🔍 Filter/Match Types — API Usage & Examples
+
+The scroll API supports multiple filter types (match types) for flexible querying. Below are all supported types, their behavior, and example usages:
+
+| Parameter         | Match Type         | Description                                                      | Example Query                                                                                 |
+|-------------------|-------------------|------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
+| `keyword`         | Partial (LIKE)    | Case-insensitive partial match on `itemName` or `sku`            | `/scroll?keyword=pump`                                                                       |
+| `zoneCode`        | Exact (case-ins.) | Case-insensitive exact match on warehouse zone                   | `/scroll?zoneCode=A1`                                                                        |
+| `status`          | Enum (exact)      | Exact match on item status (AVAILABLE, RESERVED, etc.)           | `/scroll?status=AVAILABLE`                                                                   |
+| `minPrice`        | Range (>=)        | Minimum unit price (inclusive)                                   | `/scroll?minPrice=100`                                                                       |
+| `maxPrice`        | Range (<=)        | Maximum unit price (inclusive)                                   | `/scroll?maxPrice=500`                                                                       |
+| `expiringBefore`  | Date (<=)         | Items expiring before this datetime (ISO 8601)                   | `/scroll?expiringBefore=2025-12-31T00:00:00`                                                 |
+| `belowReorder`    | Boolean           | Only items where `quantityOnHand` <= `reorderLevel`              | `/scroll?belowReorder=true`                                                                  |
+
+### Example: Combined Filters
+
+You can combine any filters for advanced queries:
+
+```bash
+curl "http://localhost:8080/api/v1/warehouse/inventory/scroll?keyword=pump&zoneCode=B1&minPrice=100&maxPrice=500&status=AVAILABLE&belowReorder=true"
+```
+
+- Returns all AVAILABLE items in zone B1, with 'pump' in name or SKU, price between 100 and 500, and needing reorder.
+
+### Filter Logic Details
+- All filters are **ANDed** together (must match all provided conditions).
+- `keyword` matches if either `itemName` or `sku` contains the value (case-insensitive).
+- `zoneCode` is case-insensitive (e.g., 'a1' and 'A1' are treated the same).
+- `status` must be a valid enum value (see API docs for allowed values).
+- `minPrice`/`maxPrice` are inclusive.
+- `expiringBefore` uses ISO 8601 format (e.g., `2025-12-31T00:00:00`).
+- `belowReorder=true` returns only items where `quantityOnHand` <= `reorderLevel`.
+
+---
+
 ## 🧪 Sample CURL Commands
 
 ```bash
@@ -397,10 +432,327 @@ export DB_PASSWORD=your_password
 
 ---
 
+## 🧩 Code & Logic Walkthrough
 
-## 🙋 Author (Mohammad Aamir Senior Java Spring Boot Microservices Developer)
+### 1. Controller: `WarehouseInventoryController`
 
-Built as a production-ready reference implementation of Spring Data Scroll API
-for warehouse-scale inventory systems.
+- **Purpose:** Exposes the `/api/v1/warehouse/inventory/scroll` endpoint for cursor-based pagination.
+- **Key Code:**
+  ```java
+  @GetMapping("/scroll")
+  public ResponseEntity<@NonNull ScrollResponse<ShipmentItemDto>> scroll(
+      @RequestParam(required = false) String keyword,
+      @RequestParam(required = false) String zoneCode,
+      @RequestParam(required = false) ItemStatus status,
+      @RequestParam(required = false) Double minPrice,
+      @RequestParam(required = false) Double maxPrice,
+      @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime expiringBefore,
+      @RequestParam(required = false) Boolean belowReorder,
+      @RequestParam(required = false) String scrollId,
+      @RequestParam(defaultValue = "20") int pageSize,
+      @RequestParam(defaultValue = "id")  String sortBy,
+      @RequestParam(defaultValue = "ASC") String sortDirection
+  ) {
+      ScrollRequest request = ScrollRequest.builder()
+          .keyword(keyword)
+          .zoneCode(zoneCode)
+          .status(status)
+          .minPrice(minPrice)
+          .maxPrice(maxPrice)
+          .expiringBefore(expiringBefore)
+          .belowReorder(belowReorder)
+          .scrollId(scrollId)
+          .pageSize(pageSize)
+          .sortBy(sortBy)
+          .sortDirection(sortDirection)
+          .build();
+      return ResponseEntity.ok(scrollService.scroll(request));
+  }
+  ```
+- **Logic:**
+  - Accepts all filter, sort, and pagination params as query parameters.
+  - Builds a `ScrollRequest` DTO.
+  - Delegates to the service layer for business logic.
+  - Returns a paginated response with items and next cursor.
 
-> ⭐ Star this repo if it helped you understand cursor pagination!
+### 2. API Endpoint Logic
+
+- **First Page:** Omit `scrollId` to start from the beginning.
+- **Next Page:** Pass `scrollId` from previous response to get the next set.
+- **Last Page:** When `hasNext=false`, `scrollId=null` (no more data).
+- **Safety:**
+  - Page size is clamped: `int safePageSize = Math.min(Math.max(request.getPageSize(), 1), 100);`
+  - Corrupt or blank scrollId resets to first page.
+
+### 3. Service Layer: `WarehouseScrollService`
+
+- **Purpose:** Handles business logic for scroll pagination.
+- **Key Code:**
+  ```java
+  @Transactional(readOnly = true)
+  public ScrollResponse<ShipmentItemDto> scroll(ScrollRequest request) {
+      ScrollPosition position = WarehouseScrollCodec.decode(request.getScrollId());
+      Specification<ShipmentItem> spec = ShipmentItemSpecification.build(
+          request.getKeyword(), request.getZoneCode(), request.getStatus(),
+          request.getMinPrice(), request.getMaxPrice(),
+          request.getExpiringBefore(), request.getBelowReorder()
+      );
+      Sort sort = buildSort(request.getSortBy(), request.getSortDirection());
+      int safePageSize = Math.min(Math.max(request.getPageSize(), 1), 100);
+      Window<ShipmentItem> window = repository.findBy(
+          spec,
+          query -> query.limit(safePageSize).sortBy(sort).scroll(position)
+      );
+      List<ShipmentItemDto> items = window.getContent().stream()
+          .map(item -> {
+              ShipmentItemDto dto = modelMapper.map(item, ShipmentItemDto.class);
+              dto.setNeedsReorder(item.getQuantityOnHand() <= item.getReorderLevel());
+              return dto;
+          }).toList();
+      String nextScrollId = null;
+      if (window.hasNext() && !window.isEmpty()) {
+          ScrollPosition nextPosition = window.positionAt(window.size() - 1);
+          nextScrollId = WarehouseScrollCodec.encode(nextPosition);
+      }
+      return ScrollResponse.<ShipmentItemDto>builder()
+          .items(items)
+          .scrollId(nextScrollId)
+          .hasNext(window.hasNext())
+          .pageSize(safePageSize)
+          .build();
+  }
+  ```
+- **Logic:**
+  - Decodes the scroll cursor.
+  - Builds a dynamic JPA specification for filtering.
+  - Builds a stable sort (always appends `id` as tiebreaker unless sorting by unique key).
+  - Executes a windowed query for efficient keyset pagination.
+  - Maps entities to DTOs and computes derived fields.
+  - Encodes the next cursor if more data exists.
+
+#### Sort Logic:
+  ```java
+  private Sort buildSort(String sortBy, String direction) {
+      Sort.Direction dir = "DESC".equalsIgnoreCase(direction) ? Sort.Direction.DESC : Sort.Direction.ASC;
+      String field = switch (sortBy.toLowerCase()) {
+          case "sku" -> "sku";
+          case "itemname", "name" -> "itemName";
+          case "zone", "zonecode" -> "zoneCode";
+          case "price", "unitprice" -> "unitPrice";
+          case "quantity", "qty" -> "quantityOnHand";
+          case "totalvalue" -> "totalValue";
+          case "expiry", "expirydate" -> "expiryDate";
+          case "createdat", "created" -> "createdAt";
+          default -> "id";
+      };
+      if ("id".equals(field) || "sku".equals(field)) {
+          return Sort.by(dir, field);
+      }
+      return Sort.by(dir, field).and(Sort.by(Sort.Direction.ASC, "id"));
+  }
+  ```
+- **Logic:**
+  - Ensures stable, deterministic pagination by always sorting by a unique key last.
+
+### 4. Util Class: `WarehouseScrollCodec`
+
+- **Purpose:** Encodes/decodes `ScrollPosition` to/from a URL-safe Base64 JSON token.
+- **Key Code:**
+  ```java
+  public static String encode(ScrollPosition position) {
+      if (position == null || position.isInitial()) return null;
+      if (position instanceof KeysetScrollPosition keyset) {
+          try {
+              Map<String, Object> keys = new LinkedHashMap<>(keyset.getKeys());
+              String json = MAPPER.writeValueAsString(keys);
+              return Base64.getUrlEncoder().withoutPadding().encodeToString(json.getBytes());
+          } catch (Exception ex) {
+              log.warn("Failed to encode scroll position: {}", ex.getMessage());
+              return null;
+          }
+      }
+      return null;
+  }
+  public static ScrollPosition decode(String token) {
+      if (token == null || token.isBlank()) return ScrollPosition.keyset();
+      try {
+          byte[] decoded = Base64.getUrlDecoder().decode(token);
+          Map<String, Object> keys = MAPPER.readValue(decoded, new TypeReference<LinkedHashMap<String, Object>>() {});
+          Map<String, Object> normalized = new LinkedHashMap<>();
+          keys.forEach((k, v) -> {
+              if (v instanceof Integer i) normalized.put(k, i.longValue());
+              else normalized.put(k, v);
+          });
+          return ScrollPosition.forward(normalized);
+      } catch (Exception ex) {
+          log.warn("Invalid scroll token received, resetting to first page. Reason: {}", ex.getMessage());
+          return ScrollPosition.keyset();
+      }
+  }
+  ```
+- **Logic:**
+  - Encodes the last row's key(s) as Base64 JSON for stateless, URL-safe cursors.
+  - Decodes and normalizes keys, always fails gracefully (never throws).
+
+### 5. Specification: `ShipmentItemSpecification`
+
+- **Purpose:** Dynamically builds JPA predicates for all filter types.
+- **Key Code:**
+  ```java
+  public static Specification<ShipmentItem> build(
+      String keyword, String zoneCode, ItemStatus status,
+      Double minPrice, Double maxPrice, LocalDateTime expiringBefore, Boolean belowReorder
+  ) {
+      return (root, query, cb) -> {
+          List<Predicate> predicates = new ArrayList<>();
+          if (keyword != null && !keyword.isBlank()) {
+              String pattern = "%" + keyword.toLowerCase() + "%";
+              predicates.add(cb.or(
+                  cb.like(cb.lower(root.get("itemName")), pattern),
+                  cb.like(cb.lower(root.get("sku")), pattern)
+              ));
+          }
+          if (zoneCode != null && !zoneCode.isBlank()) {
+              predicates.add(cb.equal(cb.lower(root.get("zoneCode")), zoneCode.toLowerCase()));
+          }
+          if (status != null) {
+              predicates.add(cb.equal(root.get("status"), status));
+          }
+          if (minPrice != null) {
+              predicates.add(cb.greaterThanOrEqualTo(root.get("unitPrice"), minPrice));
+          }
+          if (maxPrice != null) {
+              predicates.add(cb.lessThanOrEqualTo(root.get("unitPrice"), maxPrice));
+          }
+          if (expiringBefore != null) {
+              predicates.add(cb.lessThanOrEqualTo(root.get("expiryDate"), expiringBefore));
+          }
+          if (Boolean.TRUE.equals(belowReorder)) {
+              predicates.add(cb.lessThanOrEqualTo(root.get("quantityOnHand"), root.get("reorderLevel")));
+          }
+          predicates.add(cb.equal(root.get("deleted"), false));
+          return cb.and(predicates.toArray(new Predicate[0]));
+      };
+  }
+  ```
+- **Logic:**
+  - Only non-null parameters are added as predicates (AND logic).
+  - Supports partial, exact, range, and boolean filters.
+  - Always excludes soft-deleted records.
+
+---
+
+## 🛠️ Key Implementation Details & Their Uses
+
+### 1. Stable Sort with Tiebreaker
+
+**Code:**
+```java
+// If the primary field is already the unique key, no tiebreaker needed
+if ("id".equals(field) || "sku".equals(field)) {
+    return Sort.by(dir, field);
+// Multi-field sort: primary + id as stable tiebreaker
+return Sort.by(dir, field).and(Sort.by(Sort.Direction.ASC, "id"));
+```
+**Use & Logic:**
+- Ensures deterministic ordering for keyset pagination.
+- If sorting by a non-unique field (e.g., price), appends `id` as a secondary sort key.
+- Prevents duplicate or missing rows at page boundaries when multiple items share the same primary sort value.
+- If sorting by a unique field (`id` or `sku`), no tiebreaker is needed.
+
+---
+
+### 2. Safe Page Size Clamping
+
+**Code:**
+```java
+int safePageSize = Math.min(Math.max(request.getPageSize(), 1), 100);
+```
+**Use & Logic:**
+- Prevents abuse by clamping the requested page size between 1 and 100.
+- Protects the API and database from excessive load (e.g., `pageSize=999999`).
+- Ensures consistent and safe performance for all clients.
+
+---
+
+### 3. Next Cursor Encoding for Pagination
+
+**Code:**
+```java
+// 7. Encode next cursor — null if this is the last page
+String nextScrollId = null;
+if (window.hasNext() && !window.isEmpty()) {
+    ScrollPosition nextPosition = window.positionAt(window.size() - 1);
+    nextScrollId = WarehouseScrollCodec.encode(nextPosition);
+}
+```
+**Use & Logic:**
+- After fetching a page, encodes the position of the last item as a `scrollId` for the next request.
+- If there are no more items (`hasNext=false`), returns `null` for `scrollId`.
+- Enables stateless, efficient, and reliable cursor-based pagination for clients.
+
+---
+
+### 4. WarehouseScrollCodec Utility
+
+**Code:**
+```java
+public static String encode(ScrollPosition position) {
+    if (position == null || position.isInitial()) {
+        return null;
+    }
+    if (position instanceof KeysetScrollPosition keyset) {
+        try {
+            Map<String, Object> keys = new LinkedHashMap<>(keyset.getKeys());
+            String json = MAPPER.writeValueAsString(keys);
+            return Base64.getUrlEncoder()
+                    .withoutPadding()
+                    .encodeToString(json.getBytes());
+        } catch (Exception ex) {
+            log.warn("Failed to encode scroll position: {}", ex.getMessage());
+            return null;
+        }
+    }
+    return null;
+}
+
+public static ScrollPosition decode(String token) {
+    if (token == null || token.isBlank()) {
+        return ScrollPosition.keyset(); // Initial / first page
+    }
+    try {
+        byte[] decoded = Base64.getUrlDecoder().decode(token);
+        Map<String, Object> keys = MAPPER.readValue(
+                decoded,
+                new TypeReference<LinkedHashMap<String, Object>>() {}
+        );
+        Map<String, Object> normalized = new LinkedHashMap<>();
+        keys.forEach((k, v) -> {
+            if (v instanceof Integer i) {
+                normalized.put(k, i.longValue());
+            } else {
+                normalized.put(k, v);
+            }
+        });
+        return ScrollPosition.forward(normalized);
+    } catch (Exception ex) {
+        log.warn("Invalid scroll token received, resetting to first page. Reason: {}", ex.getMessage());
+        return ScrollPosition.keyset();
+    }
+}
+```
+**Use & Logic:**
+- **encode:** Converts a `ScrollPosition` (from Spring Data) into a URL-safe Base64 JSON string for use as a cursor (`scrollId`).
+  - Returns `null` for the first page (no cursor).
+  - Handles multi-key sorts by preserving key order.
+  - Never throws; logs and returns `null` on error.
+- **decode:** Converts a Base64 JSON string back into a `ScrollPosition`.
+  - Returns the initial position for null/blank/corrupt tokens (prevents cursor-poisoning attacks).
+  - Normalizes integer keys to `Long` for compatibility.
+  - Never throws; logs and resets to first page on error.
+- **Why needed:**
+  - The raw `ScrollPosition` object cannot be sent over HTTP.
+  - This utility enables stateless, secure, and robust cursor-based pagination for any client (web, mobile, etc.).
+
+---
+
